@@ -13,7 +13,7 @@ router.get("/overview", async (_req, res, next) => {
         COUNT(*) FILTER (WHERE status = 'reading')   AS books_reading,
         COUNT(*) FILTER (WHERE status = 'wishlist')   AS books_wishlist,
         COUNT(*)                                       AS books_total,
-        COALESCE(SUM(total_pages) FILTER (WHERE status = 'completed'), 0) AS total_pages_read,
+        COALESCE(SUM(CASE WHEN status = 'completed' THEN total_pages WHEN status = 'reading' THEN current_page ELSE 0 END), 0) AS total_pages_read,
         COALESCE(ROUND(AVG(total_pages) FILTER (WHERE status = 'completed')), 0) AS avg_pages_per_book,
         COALESCE(ROUND(AVG(rating) FILTER (WHERE status = 'completed' AND rating > 0), 1), 0) AS avg_rating
       FROM books
