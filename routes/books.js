@@ -1,44 +1,55 @@
 // ─────────────────────────────────────────────
-// routes/books.js — Book management CRUD + Cover Image Upload
+// routes/books.js — Book management CRUD + Cover Image Upload (Cloudinary)
 // ─────────────────────────────────────────────
 const router = require("express").Router();
 const multer = require("multer");
-const path = require("path");
-const fs = require("fs");
-const { v4: uuidv4 } = require("uuid");
+const path   = require("path");
+const { v2: cloudinary } = require("cloudinary");
 const db = require("../db");
 
-// ── Multer config for cover images ──
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => {
-    const dir = path.join(__dirname, "..", "uploads", "covers");
-    fs.mkdirSync(dir, { recursive: true });
-    cb(null, dir);
-  },
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase() || ".jpg";
-    cb(null, `${uuidv4()}${ext}`);
-  },
+// ── Configure Cloudinary ──
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key:    process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
+// ── Multer: keep file in memory (no disk write) ──
 const upload = multer({
-  storage,
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB max
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB
   fileFilter: (_req, file, cb) => {
     const allowed = /\.(jpg|jpeg|png|webp|gif)$/i;
-    if (allowed.test(path.extname(file.originalname))) {
-      cb(null, true);
-    } else {
-      cb(new Error("Only image files (jpg, png, webp, gif) are allowed"));
-    }
+    const ext = path.extname(file.originalname).toLowerCase() || ".jpg";
+    if (allowed.test(ext)) cb(null, true);
+    else cb(new Error("Only image files (jpg, png, webp, gif) are allowed"));
   },
 });
 
-// ── Helper: delete old cover file from disk ──
-function deleteOldCover(coverImage) {
-  if (!coverImage) return;
-  const fullPath = path.join(__dirname, "..", coverImage);
-  fs.unlink(fullPath, () => {}); // silently ignore errors
+// ── Upload buffer → Cloudinary, returns secure_url ──
+function uploadToCloudinary(buffer) {
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      { folder: "bookmind/covers", resource_type: "image" },
+      (error, result) => {
+        if (error) reject(error);
+        else resolve(result.secure_url);
+      }
+    );
+    stream.end(buffer);
+  });
+}
+
+// ── Delete image from Cloudinary (best-effort) ──
+async function deleteCoverImage(coverUrl) {
+  if (!coverUrl) return;
+  if (!coverUrl.includes("cloudinary.com")) return; // skip old local paths
+  try {
+    // Extract public_id from URL:
+    // https://res.cloudinary.com/{cloud}/image/upload/v{version}/{folder}/{name}.{ext}
+    const match = coverUrl.match(/\/upload\/(?:v\d+\/)?(.+)\.\w+$/);
+    if (match) await cloudinary.uploader.destroy(match[1]);
+  } catch (_) { /* silently ignore */ }
 }
 
 // ──────────────────────────────────────────────
@@ -51,7 +62,7 @@ router.get("/", async (req, res, next) => {
     const params = [];
     let idx = 1;
 
-    if (status) { sql += ` AND status = $${idx++}`; params.push(status); }
+    if (status)   { sql += ` AND status = $${idx++}`;   params.push(status); }
     if (category) { sql += ` AND category = $${idx++}`; params.push(category); }
     if (search) {
       sql += ` AND (LOWER(title) LIKE $${idx} OR LOWER(author) LIKE $${idx})`;
@@ -77,17 +88,24 @@ router.get("/:id", async (req, res, next) => {
 });
 
 // ──────────────────────────────────────────────
-// POST /api/books  (multipart/form-data with optional cover_image file)
+// POST /api/books  (multipart/form-data with optional cover_image)
 // ──────────────────────────────────────────────
 router.post("/", upload.single("cover_image"), async (req, res, next) => {
   try {
     const { title, author, category, total_pages, current_page, status, rating, review, cover_color } = req.body;
-    const cover_image = req.file ? `uploads/covers/${req.file.filename}` : null;
-    const started_at = status === "reading" ? new Date() : null;
+
+    // Upload to Cloudinary if image was sent, otherwise null
+    let cover_image = null;
+    if (req.file) {
+      cover_image = await uploadToCloudinary(req.file.buffer);
+    }
+
+    const started_at   = status === "reading"   ? new Date() : null;
     const completed_at = status === "completed" ? new Date() : null;
 
     const { rows } = await db.query(
-      `INSERT INTO books (title, author, category, total_pages, current_page, status, rating, review, cover_color, cover_image, started_at, completed_at)
+      `INSERT INTO books
+        (title, author, category, total_pages, current_page, status, rating, review, cover_color, cover_image, started_at, completed_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
       [
         title, author || "", category,
@@ -101,7 +119,7 @@ router.post("/", upload.single("cover_image"), async (req, res, next) => {
 });
 
 // ──────────────────────────────────────────────
-// PUT /api/books/:id  (multipart/form-data with optional cover_image file)
+// PUT /api/books/:id  (multipart/form-data with optional cover_image)
 // ──────────────────────────────────────────────
 router.put("/:id", upload.single("cover_image"), async (req, res, next) => {
   try {
@@ -110,39 +128,39 @@ router.put("/:id", upload.single("cover_image"), async (req, res, next) => {
     const existing = (await db.query("SELECT status, cover_image FROM books WHERE id = $1", [req.params.id])).rows[0];
     if (!existing) return res.status(404).json({ error: "Book not found" });
 
-    let started_at = undefined;
+    let started_at   = undefined;
     let completed_at = undefined;
-    if (existing.status !== "reading" && status === "reading") started_at = new Date();
+    if (existing.status !== "reading"   && status === "reading")   started_at   = new Date();
     if (existing.status !== "completed" && status === "completed") completed_at = new Date();
 
-    // If new image uploaded, replace old one
+    // Upload new image and delete old one
     let cover_image = undefined;
     if (req.file) {
-      cover_image = `uploads/covers/${req.file.filename}`;
-      deleteOldCover(existing.cover_image);
+      cover_image = await uploadToCloudinary(req.file.buffer);
+      await deleteCoverImage(existing.cover_image);
     }
 
     const { rows } = await db.query(
       `UPDATE books SET
-        title = COALESCE($1, title),
-        author = COALESCE($2, author),
-        category = COALESCE($3, category),
-        total_pages = COALESCE($4, total_pages),
-        current_page = COALESCE($5, current_page),
-        status = COALESCE($6, status),
-        rating = COALESCE($7, rating),
-        review = COALESCE($8, review),
-        cover_color = COALESCE($9, cover_color),
+        title       = COALESCE($1,  title),
+        author      = COALESCE($2,  author),
+        category    = COALESCE($3,  category),
+        total_pages = COALESCE($4,  total_pages),
+        current_page= COALESCE($5,  current_page),
+        status      = COALESCE($6,  status),
+        rating      = COALESCE($7,  rating),
+        review      = COALESCE($8,  review),
+        cover_color = COALESCE($9,  cover_color),
         cover_image = COALESCE($10, cover_image),
-        started_at = COALESCE($11, started_at),
-        completed_at = COALESCE($12, completed_at)
+        started_at  = COALESCE($11, started_at),
+        completed_at= COALESCE($12, completed_at)
        WHERE id = $13 RETURNING *`,
       [
         title, author, category,
-        total_pages !== undefined ? parseInt(total_pages) : undefined,
-        current_page !== undefined ? parseInt(current_page) : undefined,
+        total_pages   !== undefined ? parseInt(total_pages)   : undefined,
+        current_page  !== undefined ? parseInt(current_page)  : undefined,
         status,
-        rating !== undefined ? parseInt(rating) : undefined,
+        rating        !== undefined ? parseInt(rating)        : undefined,
         review, cover_color, cover_image,
         started_at, completed_at, req.params.id,
       ]
@@ -161,8 +179,8 @@ router.post("/:id/cover", upload.single("cover_image"), async (req, res, next) =
     const existing = (await db.query("SELECT cover_image FROM books WHERE id = $1", [req.params.id])).rows[0];
     if (!existing) return res.status(404).json({ error: "Book not found" });
 
-    const cover_image = `uploads/covers/${req.file.filename}`;
-    deleteOldCover(existing.cover_image);
+    const cover_image = await uploadToCloudinary(req.file.buffer);
+    await deleteCoverImage(existing.cover_image);
 
     const { rows } = await db.query(
       "UPDATE books SET cover_image = $1 WHERE id = $2 RETURNING *",
@@ -180,7 +198,7 @@ router.delete("/:id/cover", async (req, res, next) => {
     const existing = (await db.query("SELECT cover_image FROM books WHERE id = $1", [req.params.id])).rows[0];
     if (!existing) return res.status(404).json({ error: "Book not found" });
 
-    deleteOldCover(existing.cover_image);
+    await deleteCoverImage(existing.cover_image);
 
     const { rows } = await db.query(
       "UPDATE books SET cover_image = NULL WHERE id = $1 RETURNING *",
@@ -198,7 +216,7 @@ router.patch("/:id/progress", async (req, res, next) => {
     const { current_page } = req.body;
     const { rows } = await db.query(
       `UPDATE books SET current_page = $1,
-        status = CASE WHEN $1 >= total_pages AND total_pages > 0 THEN 'completed' ELSE status END,
+        status       = CASE WHEN $1 >= total_pages AND total_pages > 0 THEN 'completed' ELSE status END,
         completed_at = CASE WHEN $1 >= total_pages AND total_pages > 0 AND status != 'completed' THEN NOW() ELSE completed_at END
        WHERE id = $2 RETURNING *`,
       [current_page, req.params.id]
@@ -214,7 +232,7 @@ router.patch("/:id/progress", async (req, res, next) => {
 router.delete("/:id", async (req, res, next) => {
   try {
     const existing = (await db.query("SELECT cover_image FROM books WHERE id = $1", [req.params.id])).rows[0];
-    if (existing) deleteOldCover(existing.cover_image);
+    if (existing) await deleteCoverImage(existing.cover_image);
 
     const { rowCount } = await db.query("DELETE FROM books WHERE id = $1", [req.params.id]);
     if (rowCount === 0) return res.status(404).json({ error: "Book not found" });
@@ -226,8 +244,10 @@ router.delete("/:id", async (req, res, next) => {
 router.get("/:id/links", async (req, res, next) => {
   try {
     const { rows } = await db.query(
-      `SELECT bl.*, 
-        b.title AS linked_title, b.author AS linked_author, b.cover_image AS linked_cover_image
+      `SELECT bl.*,
+        b.title       AS linked_title,
+        b.author      AS linked_author,
+        b.cover_image AS linked_cover_image
        FROM book_links bl
        JOIN books b ON b.id = CASE WHEN bl.book_a_id = $1 THEN bl.book_b_id ELSE bl.book_a_id END
        WHERE bl.book_a_id = $1 OR bl.book_b_id = $1`,
