@@ -108,10 +108,10 @@ router.post("/", upload.single("cover_image"), async (req, res, next) => {
         (title, author, category, total_pages, current_page, status, rating, review, cover_color, cover_image, started_at, completed_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
       [
-        title, author || "", category,
+        title, author || "", category || null,
         parseInt(total_pages) || 0, parseInt(current_page) || 0,
-        status || "wishlist", parseInt(rating) || 0, review,
-        cover_color, cover_image, started_at, completed_at,
+        status || "wishlist", parseInt(rating) || 0, review || null,
+        cover_color || null, cover_image || null, started_at, completed_at,
       ]
     );
     res.status(201).json(rows[0]);
@@ -156,13 +156,13 @@ router.put("/:id", upload.single("cover_image"), async (req, res, next) => {
         completed_at= COALESCE($12, completed_at)
        WHERE id = $13 RETURNING *`,
       [
-        title, author, category,
-        total_pages   !== undefined ? parseInt(total_pages)   : undefined,
-        current_page  !== undefined ? parseInt(current_page)  : undefined,
-        status,
-        rating        !== undefined ? parseInt(rating)        : undefined,
-        review, cover_color, cover_image,
-        started_at, completed_at, req.params.id,
+        title || null, author || null, category || null,
+        total_pages  !== undefined && total_pages  !== null ? parseInt(total_pages)  : null,
+        current_page !== undefined && current_page !== null ? parseInt(current_page) : null,
+        status || null,
+        rating !== undefined && rating !== null ? parseInt(rating) : null,
+        review || null, cover_color || null, cover_image || null,
+        started_at || null, completed_at || null, req.params.id,
       ]
     );
     res.json(rows[0]);
